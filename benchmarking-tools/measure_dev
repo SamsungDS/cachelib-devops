@@ -1,0 +1,232 @@
+#!/bin/python3
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from datetime import timedelta
+import signal
+import optparse
+import json
+
+nvme_command = "nvme"
+log_id = "0x00"
+user_offset = [0,9]
+device_offset = [10,15]
+
+class LogOffset:
+
+    def __init__(self, dev):
+
+    def get_firmware_revision(self, dev):
+        cmd = (nvme_command + " id-ctrl {0}").format(dev)
+        out = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for l in out.stdout.readlines():
+            if "fr " in str(l):
+                return re.split(":", str(l.strip()).replace(' ', '').strip('\''))[1]
+
+    def get_log_id(self):
+        return log_id
+    def get_user_offset(self):
+        return user_offset 
+    def get_nand_offset(self):
+        return device_offset 
+
+class WriteStat:
+    def __init__(self, dev):
+        self.user_str = ""
+        self.nan_str = ""
+        self.dev = dev
+        pass
+
+    def get_host_writes(self):
+        return get_writes(self.user_str)
+
+    def get_physcial_writes(self):
+        return get_writes(self.nan_str)
+
+    def get_writes(self, write_type):
+        pass
+
+class DeviceWriteStat(WriteStat):
+    def __init__(self, dev):
+        super().__init__(dev)
+        self.user_str = "USER"
+        self.nan_str = "NAND"
+        self.slo = LogOffset(dev)
+        self.extended_smart = {  \
+                self.user_str: self.slo.get_user_offset(),
+                self.nan_str: self.slo.get_nand_offset()}
+
+    def get_writes(self, write_type):
+        if write_type != self.user_str and write_type != self.nan_str:
+            raise Exception("Invalid args")
+        cmd = (nvme_command + " get-log {0} --log-id={1} --log-len=512 -b").format(self.dev, self.slo.get_log_id())
+        out = subprocess.check_output(cmd, shell=True)
+        value = int.from_bytes(
+            out[self.extended_smart[write_type][0]:self.extended_smart[write_type][1]],
+            byteorder="little")
+        return value
+
+class MeasureWAF:
+    def __init__(self, dev):
+        self.user_writes_prev = None
+        self.nan_writes_prev = None
+        self.user_writes_init = None
+        self.nan_writes_init = None
+        self.time_stamp = None
+        self.write_stat = None
+        if self.in_vm():
+            self.write_stat = OcpWriteStat(dev)
+        else:
+            self.write_stat = SamsungWriteStat(dev)
+
+    @classmethod
+    def columns(cls):
+        return "{0},{1},{2}".format( \
+                "USER_W_INTERVAL(bytes),NAND_W_INTERVAL(bytes),WAF_INTERVAL", \
+                "USER_W_FROM_START(bytes),NAND_W_FROM_START(bytes),WAF_FROM_START", \
+                "USER_W_ALL(bytes),NAN_W_ALL(bytes)")
+
+    def in_vm(self):
+        vm_str = "Hypervisor detected"
+        cmd = "dmesg"
+        out = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for line in out.stdout.readlines():
+            if vm_str in str(line):
+                return True
+        return False
+
+    def start_interval(self):
+        self.user_writes_prev = self.write_stat.get_writes(self.write_stat.user_str)
+        self.nan_writes_prev = self.write_stat.get_writes(self.write_stat.nan_str)
+        self.user_writes_init = self.user_writes_prev
+        self.nan_writes_init = self.nan_writes_prev
+        self.time_stamp = datetime.now()
+
+    def lap_interval(self):
+        user_writes_now = self.write_stat.get_writes(self.write_stat.user_str)
+        nan_writes_now = self.write_stat.get_writes(self.write_stat.nan_str)
+
+        user_writes_interval = user_writes_now - self.user_writes_prev
+        nan_writes_interval = nan_writes_now  - self.nan_writes_prev
+        if user_writes_interval == 0:
+            waf_interval = 1
+        else:
+            waf_interval = nan_writes_interval / user_writes_interval
+
+        user_writes_from_init = user_writes_now - self.user_writes_init
+        nan_writes_from_init = nan_writes_now - self.nan_writes_init
+        if user_writes_from_init == 0:
+            waf_from_init = 1
+        else:
+            waf_from_init = nan_writes_from_init / user_writes_from_init
+
+        self.user_writes_prev = user_writes_now
+        self.nan_writes_prev = nan_writes_now
+
+        return (user_writes_interval, nan_writes_interval, waf_interval, \
+                user_writes_from_init, nan_writes_from_init, waf_from_init, \
+                user_writes_now, nan_writes_now )
+
+class MeasureUsageNvme(MeasureUsage):
+    def __init__(self, dev, md_dev):
+        super().__init__(dev, md_dev)
+
+    def get_usage(self):
+        cmd = nvme_command + " list --output-format=json"
+        out = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        json_out = json.loads(out.stdout.read())
+        for d in json_out["Devices"]:
+            if str(self.dev) in d["DevicePath"]:
+                allocated = float(d["UsedBytes"])
+                allocatable = float(d["PhysicalSize"])
+                return (allocated/allocatable, allocatable, allocated)
+
+        raise Exception("Error while gettin nvme usage")
+
+class MeasureMem:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def columns(cls):
+        return "MEM_TOTAL(bytes),MEM_FREE(bytes),MEM_AVAIL(bytes)"
+
+    def start_interval(self):
+        pass
+
+    def lap_interval(self):
+        cmd = "cat /proc/meminfo"
+        out = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for line in out.stdout.readlines():
+            if "MemTotal:" in str(line):
+                mem_total = float(re.findall(r'\d+', str(line))[0])
+            if "MemFree:" in str(line):
+                mem_free = float(re.findall(r'\d+', str(line))[0])
+            if "MemAvailable:" in str(line):
+                mem_available = float(re.findall(r'\d+', str(line))[0])
+        return (mem_total, mem_free, mem_available)
+
+def signal_handler(signal, frame):
+    global measurements
+    time.sleep(1)
+
+    print("{0},".format(datetime.now()), end='')
+    for m in measurements:
+        val = m.lap_interval()
+        print("{0},".format(','.join(map(str,val))), end='', flush=True)
+    print (" ", flush=True)
+    sys.exit(1)
+
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+def main():
+    parser = optparse.OptionParser()
+
+    # add options
+    parser.add_option('-d', '--dev', dest = 'dev',
+                      type = 'string',
+                      help = 'The main device to measure')
+    parser.add_option('-i', '--interval', dest = 'interval',
+                      type = 'int', default = 15,
+                      help = 'Intervale between each measurement')
+    (options, args) = parser.parse_args()
+
+    if options.dev == None:
+        print(parser.usage)
+        exit (1)
+
+    global measurements
+    measurements = []
+    measurements.append(MeasureWAF(options.dev))
+    measurements.append(MeasureMem())
+    measurements.append(MeasureUsageNvme(options.dev))
+
+    print("TIME(ms),", end='')
+    for m in measurements:
+        print("{0},".format(m.columns()), end='', flush=True)
+        m.start_interval()
+    print(" ", flush=True)
+
+    while True:
+        try:
+            time.sleep(options.interval)
+            print("{0},".format(datetime.now()), end='')
+            for m in measurements:
+                val = m.lap_interval()
+                print("{0},".format(','.join(map(str,val))), end='', flush=True)
+
+            print (" ", flush=True)
+
+        except Exception as e:
+            print("Error : %s" % e)
+            sys.exit(1)
+
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
+    sys.exit(0)
+
