@@ -1,0 +1,16 @@
+NVME_COMMAND=nvme
+NVME_DEVICE=
+BLOCK_SIZE=4096
+CACHELIB_DIR=/CacheLib
+CACHELIB_BRANCH=main
+#Path to config file for running cachebench relative to CACHELIB_DIR path
+CACHEBENCH_RUN_CONFIG=cachelib/cachebench/test_configs/fdp_test/config_kvcache.json
+LOG_DIR=
+NVME_PRECONDITIONING_RUNS=2
+SAMPLING_INTERVAL_SEC=1220
+WAF_SCRIPT=/cachelib-devops/benchmarking-tools/measure_dev
+FDP_FEAT=0x1D
+FILL_UTILIZATION=100
+#Allocates RUs 0..NUM_RU_HANDLES-1 to the namespace being created if FDP is enabled
+NUM_RU_HANDLES=7
+NS_DEV_UTIL_PERCENT=100

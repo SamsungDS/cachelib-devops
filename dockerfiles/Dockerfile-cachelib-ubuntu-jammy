@@ -1,0 +1,55 @@
+## Buildkit is a new docker build backend (since 18) that in addition to all the improved
+## building feature allows you to use ssh to access private data during builds.
+## To build using this Dockerfile you need to run export DOCKER_BUILDKIT=1 in your shell first.
+FROM ubuntu:22.04
+MAINTAINER Vivek Shah "vi.shah@samsung.com"
+SHELL ["/bin/bash", "-c"]
+# Keep the list of packages installed alphabetically sorted to prevent duplicates
+RUN apt-get update && apt-get install -y \
+     build-essential \
+     git \
+     emacs-nox \
+     htop \
+     libjson-c-dev \
+     meson \
+     ninja-build \
+     screen \
+     sudo \
+     vim
+
+## Disabled detached head warnings which we will encounter a lot due to
+## cloning of submodules within the projects for dependencies.
+RUN git config --global advice.detachedHead false
+
+## Clone and build nvme-cli which is used to manipulate the NVMe device.
+RUN git clone https://github.com/linux-nvme/nvme-cli.git \
+    && cd nvme-cli \
+    && meson setup --force-fallback-for=libnvme .build \
+    && meson compile -C .build \
+    && meson install -C .build \
+    && cd ..
+
+## Remove any native liburing that might be installed
+RUN apt-get remove -y liburing-dev liburing2
+
+## Clone and install liburing
+RUN git clone https://github.com/axboe/liburing.git \
+    && cd liburing \
+    && make \
+    && make install \
+    && cd ..
+
+## Generate the skeleton ssh directories and known hosts to prevent host verification
+## warnings
+RUN mkdir -p -m 0700 ~/.ssh && ssh-keyscan github.com > ~/.ssh/known_hosts
+
+## Clone the repository that contains tools necessary for experimentation
+## to minimize manual effort and ensure reproducibility.
+RUN git clone git@github.com:SamsungDS/cachelib-devops.git
+
+## Clone and download the software dependencies of the Cachelib project to 
+## ensure all the dependencies have been pulled into the container.
+RUN git clone https://github.com/facebook/CacheLib.git \
+    && cd CacheLib \
+    && ./contrib/build.sh -Bv \
+    && cd ..
